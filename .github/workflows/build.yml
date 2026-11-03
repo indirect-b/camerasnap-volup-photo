@@ -1,0 +1,133 @@
+name: 手动构建 APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建与检查
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 配置 Java
+        uses: actions/setup-java@v6.0.1
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: 安装 Android SDK
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-37.0" "build-tools;37.0.0"'
+
+      - name: 构建 APK 并运行检查
+        shell: bash
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease :app:testDebugUnitTest :app:lintRelease --no-daemon --console=plain
+
+      - name: 签名并验证 Release APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          for required in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS; do
+            if [[ -z "${!required}" ]]; then
+              printf '::error::未配置签名 Secret：%s\n' "$required"
+              exit 1
+            fi
+          done
+          umask 077
+          keystore="$(mktemp "$RUNNER_TEMP/camerasnap-keystore.XXXXXX")"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          unset ANDROID_KEYSTORE_BASE64
+          tools="$ANDROID_HOME/build-tools/37.0.0"
+          mkdir -p build/signed-apk
+          for apk in app/build/outputs/apk/release/*.apk; do
+            signed="build/signed-apk/$(basename "$apk")"
+            "$tools/zipalign" -c -P 16 4 "$apk"
+            "$tools/apksigner" sign --ks "$keystore" --ks-key-alias "$ANDROID_KEY_ALIAS" --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEYSTORE_PASSWORD --out "$signed" "$apk"
+            "$tools/apksigner" verify --verbose --print-certs "$signed"
+            "$tools/zipalign" -c -P 16 4 "$signed"
+          done
+
+      - name: 上传已签名 Release APK
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: CameraSnap-release-${{ github.run_number }}
+          path: build/signed-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: 上传检查报告
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: CameraSnap-reports-${{ github.run_number }}
+          path: |
+            app/build/reports/
+            app/build/test-results/testDebugUnitTest/
+            app/build/outputs/mapping/release/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: 读取发布版本
+        id: release
+        shell: bash
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import re
+          from pathlib import Path
+
+          metadata = json.loads(Path("app/build/outputs/apk/release/output-metadata.json").read_text())
+          versions = {(element["versionCode"], element["versionName"]) for element in metadata["elements"]}
+          if len(versions) != 1:
+              raise SystemExit("APK 版本信息不一致")
+          code, name = versions.pop()
+          if not isinstance(code, int) or code < 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name):
+              raise SystemExit("APK 版本信息不适合生成 Release 标签")
+          print(f"tag=v{name}")
+          print(f"name=v{name}")
+          print(f"module_tag={code}-{name}")
+          print(f"module_name={name}")
+          PY
+
+      - name: 发布到 GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          RELEASE_NAME: ${{ steps.release.outputs.name }}
+        run: |
+          bash .github/scripts/publish-release.sh "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$RELEASE_NAME" "" "$GITHUB_SHA"
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq '.body // ""' > build/release-notes.md
+
+      - name: 同步到 Xposed Modules Repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.MODULES_REPO_TOKEN }}
+          MODULE_REPOSITORY: Xposed-Modules-Repo/io.github.vay1314.camerasnap
+          RELEASE_TAG: ${{ steps.release.outputs.module_tag }}
+          RELEASE_NAME: ${{ steps.release.outputs.module_name }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            printf '::error::请配置有模块仓库写入权限的 Secret：MODULES_REPO_TOKEN\n'
+            exit 1
+          fi
+          bash .github/scripts/publish-release.sh "$MODULE_REPOSITORY" "$RELEASE_TAG" "$RELEASE_NAME" build/release-notes.md
