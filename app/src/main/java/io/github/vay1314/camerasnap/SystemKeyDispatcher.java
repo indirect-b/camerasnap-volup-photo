@@ -1,0 +1,337 @@
+package io.github.vay1314.camerasnap;
+
+import android.content.BroadcastReceiver;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.ServiceConnection;
+import android.database.ContentObserver;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Build;
+import android.os.PowerManager;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.KeyEvent;
+import android.view.ViewConfiguration;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+final class SystemKeyDispatcher {
+    private final Context context;
+    private final HookEntry module;
+    private final Handler worker;
+    private final HandlerThread thread;
+    private final PowerManager power;
+    private final PressGesture gesture;
+    private volatile int mode = SnapConfig.OFF;
+    private volatile boolean ready;
+    private volatile boolean closed;
+    private boolean cleanupFailed;
+    private ContentObserver observer;
+    private BroadcastReceiver receiver;
+    private boolean observerRegistered, receiverRegistered;
+    private boolean claimedVolumeDown;
+    private static final long DOUBLE_PRESS_TIMEOUT_MS = 400;
+    private long lastTapUpTime = -1;
+    private long lastDownTime = -1;
+    private volatile long lastVolumeUpDownTime = -1;
+    private boolean doublePressDown;
+    private volatile boolean toggleActive;
+    private boolean startedByHold;
+    private final String hookDescription;
+    private int retries;
+    private final Runnable refresh = this::reload;
+    private BoundCapture capture;
+    private final Runnable captureTimeout = () -> {
+        toggleActive = false;
+        stopCapture();
+    };
+
+    SystemKeyDispatcher(Context context, HookEntry module, String description) {
+        this.context = context;
+        this.module = module;
+        this.hookDescription = description;
+        power = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        thread = new HandlerThread("CameraSnapPolicy");
+        thread.start();
+        worker = new Handler(thread.getLooper());
+        gesture = new PressGesture(new PressGesture.Scheduler() {
+            @Override public void schedule(Runnable task, long delay) { worker.postDelayed(task, delay); }
+            @Override public void cancel(Runnable task) { worker.removeCallbacks(task); }
+        }, new PressGesture.Actions() {
+            @Override public void start() {
+                if (capture != null) return;
+                startedByHold = true;
+                startCapture();
+            }
+            @Override public void stop() {
+                if (!startedByHold) return;
+                startedByHold = false;
+                stopCapture();
+            }
+        });
+        worker.post(() -> {
+            if (closed) return;
+            try {
+                observer = new ContentObserver(worker) {
+                    @Override public void onChange(boolean selfChange) { reload(); }
+                };
+                context.getContentResolver().registerContentObserver(SnapConfig.URI, true, observer);
+                observerRegistered = true;
+                IntentFilter filter = new IntentFilter(Intent.ACTION_SCREEN_ON);
+                filter.addAction("android.intent.action.USER_SWITCHED");
+                receiver = new BroadcastReceiver() {
+                    @Override public void onReceive(Context ctx, Intent intent) {
+                        gesture.cancel();
+                        toggleActive = false;
+                        lastVolumeUpDownTime = -1;
+                        stopCapture();
+                    }
+                };
+                if (Build.VERSION.SDK_INT >= 33)
+                    context.registerReceiver(receiver, filter, null, worker, Context.RECEIVER_NOT_EXPORTED);
+                else context.registerReceiver(receiver, filter, null, worker);
+                receiverRegistered = true;
+                reload();
+            } catch (RuntimeException e) { module.log(Log.ERROR, HookEntry.TAG, "Policy registration failed", e); }
+        });
+    }
+
+    private void reload() {
+        if (closed) return;
+        try {
+            SnapConfig config = SnapConfig.fromBundle(context.getContentResolver().call(SnapConfig.URI, "get", null, null));
+            if (mode != config.mode) {
+                gesture.cancel();
+                toggleActive = false;
+                lastVolumeUpDownTime = -1;
+                stopCapture();
+            }
+            mode = config.mode;
+            ready = true;
+            retries = 0;
+            worker.removeCallbacks(refresh);
+            context.getContentResolver().call(SnapConfig.URI, "system_ready", hookDescription, null);
+        } catch (RuntimeException e) {
+            gesture.cancel();
+            mode = SnapConfig.OFF;
+            ready = false;
+            if (!closed && retries++ < 12) {
+                worker.removeCallbacks(refresh);
+                worker.postDelayed(refresh, 5000);
+            }
+            module.log(Log.WARN, HookEntry.TAG, "Module configuration unavailable; keys retain original behavior", e);
+        }
+    }
+
+    boolean intercept(KeyEvent event, int userId) {
+        if (closed) return false;
+        int key = event.getKeyCode();
+        boolean up = event.getAction() == KeyEvent.ACTION_UP;
+
+        if (key == KeyEvent.KEYCODE_VOLUME_DOWN && up) {
+            boolean consumed = claimedVolumeDown;
+            claimedVolumeDown = false;
+            if (doublePressDown) {
+                doublePressDown = false;
+                return true;
+            }
+            if (consumed && lastDownTime > 0 &&
+                    event.getEventTime() - lastDownTime < ViewConfiguration.getLongPressTimeout()) {
+                lastTapUpTime = event.getEventTime();
+            }
+            worker.post(gesture::cancel);
+            return consumed;
+        }
+
+        if (key == KeyEvent.KEYCODE_VOLUME_DOWN && event.getRepeatCount() > 0) return claimedVolumeDown;
+        if (!ready) {
+            if (key == KeyEvent.KEYCODE_VOLUME_DOWN && event.getRepeatCount() == 0) worker.post(refresh);
+            return false;
+        }
+        if (userId != 0 || power == null || power.isInteractive() || mode == SnapConfig.OFF) {
+            worker.post(gesture::cancel);
+            return false;
+        }
+        if (key == KeyEvent.KEYCODE_VOLUME_UP && !up && event.getRepeatCount() == 0) {
+            // Volume UP is observed, never consumed: a spaced single press must keep
+            // raising the volume exactly as before. Only a fast double-press (two
+            // DOWNs within DOUBLE_PRESS_TIMEOUT_MS) triggers a single photo, and the
+            // volume still rises by two steps as the price of not consuming the keys.
+            // The gates above already validated ready / user 0 / screen off / mode.
+            worker.post(gesture::cancel);
+            long downTime = event.getDownTime();
+            if (lastVolumeUpDownTime > 0 && downTime - lastVolumeUpDownTime <= DOUBLE_PRESS_TIMEOUT_MS) {
+                lastVolumeUpDownTime = -1;
+                worker.post(() -> {
+                    if (!closed && mode != SnapConfig.OFF && !power.isInteractive() && capture == null)
+                        takeSinglePhoto();
+                });
+            } else {
+                lastVolumeUpDownTime = downTime;
+            }
+            return false;
+        }
+        if (key == KeyEvent.KEYCODE_POWER || key == KeyEvent.KEYCODE_VOLUME_UP) {
+            worker.post(gesture::cancel);
+            return false;
+        }
+        if (key != KeyEvent.KEYCODE_VOLUME_DOWN) return false;
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            claimedVolumeDown = true;
+            if (event.getRepeatCount() == 0) {
+                if (lastTapUpTime > 0 && event.getDownTime() - lastTapUpTime <= DOUBLE_PRESS_TIMEOUT_MS) {
+                    doublePressDown = true;
+                    lastTapUpTime = -1;
+                    // Cancel the long-press trigger pending from the first tap:
+                    // without this, after a double-press STOP the stale trigger
+                    // would fire and restart capture as a hold session.
+                    worker.post(gesture::cancel);
+                    if (toggleActive) {
+                        toggleActive = false;
+                        worker.post(this::stopCapture);
+                    } else {
+                        toggleActive = true;
+                        worker.post(() -> {
+                            if (!closed && mode != SnapConfig.OFF && !power.isInteractive())
+                                startCapture();
+                            else toggleActive = false;
+                        });
+                    }
+                } else {
+                    lastDownTime = event.getDownTime();
+                    long due = event.getDownTime() + ViewConfiguration.getLongPressTimeout();
+                    worker.post(() -> {
+                        if (!closed && mode != SnapConfig.OFF && !power.isInteractive())
+                            gesture.down(due - SystemClock.uptimeMillis());
+                    });
+                }
+            }
+        }
+        return true;
+    }
+
+    private void startCapture() {
+        if (closed || mode == SnapConfig.OFF || power.isInteractive()) return;
+        stopCapture();
+        Intent service = new Intent(SnapConfig.ACTION_START)
+                .setClassName(SnapConfig.PACKAGE, SnapConfig.PACKAGE + ".SnapService");
+        capture = new BoundCapture(new BoundCapture.Transport() {
+            private ServiceConnection connection;
+
+            @Override public boolean bind(Runnable connected, Runnable disconnected) {
+                connection = new ServiceConnection() {
+                    @Override public void onServiceConnected(ComponentName name, IBinder binder) {
+                        try { connected.run(); }
+                        catch (RuntimeException e) { module.log(Log.ERROR, HookEntry.TAG, "Bound capture start failed", e); }
+                    }
+                    private void disconnect() {
+                        try { disconnected.run(); }
+                        catch (RuntimeException e) { module.log(Log.ERROR, HookEntry.TAG, "Capture binding cleanup failed", e); }
+                    }
+                    @Override public void onServiceDisconnected(ComponentName name) { disconnect(); }
+                    @Override public void onBindingDied(ComponentName name) { disconnect(); }
+                    @Override public void onNullBinding(ComponentName name) {
+                        module.log(Log.ERROR, HookEntry.TAG, "Capture service returned a null binding");
+                        disconnect();
+                    }
+                };
+                int flags = Context.BIND_AUTO_CREATE;
+                if (Build.VERSION.SDK_INT >= 30) flags |= Context.BIND_INCLUDE_CAPABILITIES;
+                return context.bindService(service, flags, worker::post, connection);
+            }
+
+            @Override public void start() {
+                if (closed || mode == SnapConfig.OFF || power.isInteractive())
+                    throw new IllegalStateException("Capture gesture is no longer eligible");
+                context.startForegroundService(service);
+                worker.removeCallbacks(captureTimeout);
+                worker.postDelayed(captureTimeout, SnapConfig.MAX_SESSION_MS + 15_000);
+                module.log(Log.INFO, HookEntry.TAG, "Capture started with system service binding, capabilities=" +
+                        (Build.VERSION.SDK_INT >= 30));
+            }
+
+            @Override public void stop() {
+                context.startService(new Intent(SnapConfig.ACTION_STOP)
+                        .setClassName(SnapConfig.PACKAGE, SnapConfig.PACKAGE + ".SnapService"));
+            }
+
+            @Override public void unbind() { context.unbindService(connection); }
+        });
+        try {
+            if (capture.begin()) worker.postDelayed(captureTimeout, 15_000);
+            else { capture = null; toggleActive = false; module.log(Log.ERROR, HookEntry.TAG, "Capture service binding was rejected"); }
+        } catch (RuntimeException e) {
+            capture = null;
+            toggleActive = false;
+            module.log(Log.ERROR, HookEntry.TAG, "Street snap service could not bind", e);
+        }
+    }
+
+    // Single PNG photo via volume-up double-press. No binding is held: the service
+    // runs to completion on its own and stops itself after saving the one photo.
+    // While a service engine is busy, a second start is ignored by SnapService, so
+    // a second double-press during an in-flight photo is a harmless no-op. The
+    // dispatcher only guards against overlapping a volume-down session (capture).
+    private void takeSinglePhoto() {
+        if (closed || mode == SnapConfig.OFF || power.isInteractive() || capture != null) return;
+        Intent photo = new Intent(SnapConfig.ACTION_SINGLE_PHOTO)
+                .setClassName(SnapConfig.PACKAGE, SnapConfig.PACKAGE + ".SnapService");
+        try {
+            context.startForegroundService(photo);
+        } catch (RuntimeException e) {
+            module.log(Log.ERROR, HookEntry.TAG, "Single photo service could not start", e);
+        }
+    }
+
+    private void stopCapture() {
+        worker.removeCallbacks(captureTimeout);
+        BoundCapture current = capture;
+        capture = null;
+        try {
+            if (current != null) current.stop();
+        } catch (RuntimeException e) {
+            cleanupFailed = true;
+            module.log(Log.ERROR, HookEntry.TAG, "Street snap service could not stop", e);
+        }
+    }
+
+    boolean closeAndAwait(long timeoutMs) throws InterruptedException {
+        if (Looper.myLooper() == worker.getLooper()) return false;
+        closed = true;
+        ready = false;
+        mode = SnapConfig.OFF;
+        CountDownLatch cleaned = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean success = new java.util.concurrent.atomic.AtomicBoolean(true);
+        worker.removeCallbacksAndMessages(null);
+        if (!worker.post(() -> {
+            try {
+                gesture.cancel();
+                stopCapture();
+                if (observerRegistered) {
+                    context.getContentResolver().unregisterContentObserver(observer);
+                    observerRegistered = false;
+                }
+                if (receiverRegistered) {
+                    context.unregisterReceiver(receiver);
+                    receiverRegistered = false;
+                }
+            } catch (RuntimeException e) {
+                success.set(false);
+                module.log(Log.ERROR, HookEntry.TAG, "Hot reload policy cleanup failed", e);
+            } finally {
+                worker.removeCallbacksAndMessages(null);
+                thread.quitSafely();
+                cleaned.countDown();
+            }
+        })) return !thread.isAlive();
+        long deadline = SystemClock.elapsedRealtime() + timeoutMs;
+        if (!cleaned.await(timeoutMs, TimeUnit.MILLISECONDS)) return false;
+        thread.join(Math.max(1, deadline - SystemClock.elapsedRealtime()));
+        return success.get() && !cleanupFailed && !thread.isAlive();
+    }
+}
