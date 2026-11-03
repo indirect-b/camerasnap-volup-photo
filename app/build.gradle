@@ -1,0 +1,63 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    compileSdk 37
+
+    defaultConfig {
+        namespace 'io.github.vay1314.camerasnap'
+        applicationId namespace
+        minSdk 29
+        targetSdk 37
+        versionCode 2021
+        versionName "2.0.2-doublepress"
+        applicationVariants.configureEach { variant ->
+            variant.outputs.configureEach {
+                outputFileName = "CameraSnap_" + versionName + "(" + versionCode + ").apk"
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+    buildFeatures {
+        buildConfig = true
+        compose = true
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+    packagingOptions {
+        resources {
+            excludes += "/META-INF/LICENSE*"
+            excludes += "/META-INF/NOTICE*"
+            excludes += "/kotlin/**"
+            excludes += "/*.txt"
+            excludes += "/*.bin"
+            excludes += "/*.json"
+        }
+        dex {
+            useLegacyPackaging = true
+        }
+    }
+}
+
+dependencies {
+    implementation 'top.yukonga.miuix.kmp:miuix-ui-android:0.9.4'
+    implementation 'top.yukonga.miuix.kmp:miuix-preference-android:0.9.4'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'org.jetbrains.compose.foundation:foundation-android:1.12.2'
+    compileOnly 'io.github.libxposed:api:102.0.0'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'io.github.libxposed:api:102.0.0'
+}
