@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name" translatable="false">CameraSnap</string>
+    <string name="xposed_desc" translatable="false">为 HyperOS 提供息屏长按音量下键拍照与录像功能</string>
+</resources>
