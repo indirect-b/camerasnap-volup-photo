@@ -158,4 +158,4 @@ public final class SnapService extends Service {
     }
 
     @Override public IBinder onBind(Intent intent) { return new Binder(); }
-}
+} 
